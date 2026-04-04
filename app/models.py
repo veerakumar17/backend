@@ -57,6 +57,7 @@ class Policy(Base):
     weeks_paid = Column(Integer, default=0)
     is_eligible = Column(Boolean, default=False)
     status = Column(Enum(PolicyStatus), default=PolicyStatus.active)
+    grace_period_end = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     worker = relationship("Worker", back_populates="policy")
@@ -67,11 +68,12 @@ class Policy(Base):
 class Premium(Base):
     __tablename__ = "premiums"
 
-    id = Column(Integer, primary_key=True, index=True)
-    policy_id = Column(Integer, ForeignKey("policies.id"), nullable=False)
-    amount = Column(Float, nullable=False)
-    status = Column(String, default="paid")
-    paid_at = Column(DateTime, default=datetime.utcnow)
+    id          = Column(Integer, primary_key=True, index=True)
+    policy_id   = Column(Integer, ForeignKey("policies.id"), nullable=False)
+    amount      = Column(Float, nullable=False)
+    week_number = Column(Integer, nullable=True)
+    status      = Column(String, default="paid")
+    paid_at     = Column(DateTime, default=datetime.utcnow)
 
     policy = relationship("Policy", back_populates="premiums")
 
@@ -84,7 +86,10 @@ class Claim(Base):
     trigger_type = Column(String, nullable=False)
     trigger_value = Column(Float, nullable=False)
     payout_amount = Column(Float, nullable=False)
+    fraud_score = Column(Float, default=0.0)
     status = Column(Enum(ClaimStatus), default=ClaimStatus.approved)
+    admin_note = Column(String, nullable=True)
+    triggered_by = Column(String, default="system")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     policy = relationship("Policy", back_populates="claims")

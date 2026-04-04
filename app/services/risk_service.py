@@ -1,13 +1,22 @@
 import joblib
 import numpy as np
+import pandas as pd
 import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Works both locally and on Render regardless of working directory
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# app/services -> app -> backend root
+BASE_DIR = os.path.dirname(os.path.dirname(_THIS_DIR))
 MODEL_PATH = os.path.join(BASE_DIR, "model", "model.pkl")
 FEATURES_PATH = os.path.join(BASE_DIR, "model", "features.pkl")
 
+# Fallback: try relative to cwd (Render sets cwd to repo root)
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = os.path.join(os.getcwd(), "model", "model.pkl")
+    FEATURES_PATH = os.path.join(os.getcwd(), "model", "features.pkl")
+
 if not os.path.exists(MODEL_PATH) or not os.path.exists(FEATURES_PATH):
-    raise RuntimeError(f"Model files not found at {MODEL_PATH}. Run train_model.py first.")
+    raise RuntimeError(f"Model files not found at {MODEL_PATH}. Ensure model/ folder is committed to git.")
 
 model = joblib.load(MODEL_PATH)
 feature_columns = joblib.load(FEATURES_PATH)
@@ -44,7 +53,7 @@ def predict_risk_from_env(weather: dict, aqi: dict) -> dict:
         "flood_occurred": flood_occurred,
     }
 
-    input_values = np.array([[input_data[col] for col in feature_columns]])
+    input_values = pd.DataFrame([[input_data[col] for col in feature_columns]], columns=feature_columns)
     proba = model.predict_proba(input_values)[0]
 
     class_weights = np.array([0.0, 0.5, 1.0])

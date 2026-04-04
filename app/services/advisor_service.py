@@ -21,36 +21,48 @@ def get_plan_recommendation(weekly_salary: float, risk_score: float, weather_con
     else:
         risk_level = "High"
 
-    prompt = f"""You are an insurance advisor AI.
+    # Rule-based fallback: salary + risk determines plan
+    if risk_level == "Low" and weekly_salary < 3000:
+        fallback_plan = "Basic"
+    elif risk_level == "High" or weekly_salary >= 5000:
+        fallback_plan = "Premium"
+    elif risk_level == "Medium" or weekly_salary >= 3000:
+        fallback_plan = "Standard"
+    else:
+        fallback_plan = "Basic"
+
+    prompt = f"""You are an insurance advisor AI for gig delivery workers in India.
 
 User details:
-- Weekly Salary: {weekly_salary}
+- Weekly Salary: Rs.{weekly_salary}
 - Risk Score: {risk_score} ({risk_level} Risk)
-- Weather Condition: {weather_condition}
+- Current Weather Condition: {weather_condition}
 
 Available Plans:
-1. Basic Plan - Weekly Premium: Rs.20, Max Payout: Rs.300 (low coverage, low cost)
-2. Standard Plan - Weekly Premium: Rs.35, Max Payout: Rs.600 (medium coverage)
-3. Premium Plan - Weekly Premium: Rs.50, Max Payout: Rs.1000 (high coverage, high cost)
+1. Basic Plan   - Weekly Premium: Rs.20, Max Payout: Rs.300  → best for low salary (below Rs.3000/week) and low risk
+2. Standard Plan - Weekly Premium: Rs.35, Max Payout: Rs.600  → best for medium salary (Rs.3000–5000/week) or medium risk
+3. Premium Plan  - Weekly Premium: Rs.50, Max Payout: Rs.1000 → best for high salary (above Rs.5000/week) or high risk
 
-Task:
-Suggest the most suitable plan for the user.
-Also explain WHY in simple terms.
+Rules:
+- If salary is low (below Rs.3000) and risk is Low → recommend Basic
+- If risk is High or salary is above Rs.5000 → recommend Premium
+- Otherwise → recommend Standard
+- If weather condition is extreme (Heavy Rain, Extreme Heat, Severe Pollution) → lean toward higher plan
 
-Keep answer short and clear.
-End your response with exactly this line:
-Recommended Plan: <plan name>"""
+Explain your recommendation in 2–3 simple sentences.
+End your response with exactly this line (no extra text after it):
+Recommended Plan: <Basic or Standard or Premium>"""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
+        temperature=0.3,
         max_tokens=300,
     )
 
     reply = response.choices[0].message.content.strip()
 
-    recommended_plan = "Standard"
+    recommended_plan = fallback_plan
     for plan in PLANS:
         if f"Recommended Plan: {plan}" in reply:
             recommended_plan = plan

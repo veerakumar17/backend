@@ -40,6 +40,7 @@ class WorkerResponse(BaseModel):
 class PolicyCreate(BaseModel):
     worker_id: int
     plan: PlanType
+    risk_score: Optional[float] = 0.5
 
 
 class PolicyResponse(BaseModel):
@@ -61,6 +62,7 @@ class PremiumResponse(BaseModel):
     id: int
     policy_id: int
     amount: float
+    week_number: Optional[int]
     status: str
     paid_at: datetime
 
@@ -80,7 +82,10 @@ class ClaimResponse(BaseModel):
     trigger_type: str
     trigger_value: float
     payout_amount: float
+    fraud_score: float
     status: ClaimStatus
+    admin_note: Optional[str] = None
+    triggered_by: Optional[str] = "system"
     created_at: datetime
 
     class Config:
