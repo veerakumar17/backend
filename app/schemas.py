@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-from app.models import DeliveryPlatform, PlanType, PolicyStatus, ClaimStatus
+from app.models import DeliveryPlatform, PlanType, PolicyStatus, ClaimStatus, PayoutStatus
 
 
 class WorkerCreate(BaseModel):
@@ -86,6 +86,9 @@ class ClaimResponse(BaseModel):
     status: ClaimStatus
     admin_note: Optional[str] = None
     triggered_by: Optional[str] = "system"
+    payout_status: Optional[PayoutStatus] = PayoutStatus.pending
+    payout_transaction_id: Optional[str] = None
+    payout_processed_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:

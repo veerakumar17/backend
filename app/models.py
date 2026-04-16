@@ -78,6 +78,12 @@ class Premium(Base):
     policy = relationship("Policy", back_populates="premiums")
 
 
+class PayoutStatus(str, enum.Enum):
+    pending   = "pending"
+    processed = "processed"
+    failed    = "failed"
+
+
 class Claim(Base):
     __tablename__ = "claims"
 
@@ -90,6 +96,9 @@ class Claim(Base):
     status = Column(Enum(ClaimStatus), default=ClaimStatus.approved)
     admin_note = Column(String, nullable=True)
     triggered_by = Column(String, default="system")
+    payout_status = Column(Enum(PayoutStatus), default=PayoutStatus.pending)
+    payout_transaction_id = Column(String, nullable=True)
+    payout_processed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     policy = relationship("Policy", back_populates="claims")
