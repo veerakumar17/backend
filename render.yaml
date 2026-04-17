@@ -3,7 +3,7 @@ services:
     name: ai-gig-worker-insurance-backend
     runtime: python
     buildCommand: pip install -r requirements.txt && python -m alembic upgrade head
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENWEATHER_API_KEY
         sync: false
@@ -13,4 +13,6 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
     plan: free
