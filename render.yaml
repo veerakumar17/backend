@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ai-gig-worker-insurance-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python -m alembic upgrade head
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: AQICN_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+    plan: free

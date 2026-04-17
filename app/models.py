@@ -99,6 +99,10 @@ class Claim(Base):
     payout_status = Column(Enum(PayoutStatus), default=PayoutStatus.pending)
     payout_transaction_id = Column(String, nullable=True)
     payout_processed_at = Column(DateTime, nullable=True)
+    # Weather snapshot at claim creation time — used for fake weather fraud detection
+    weather_rainfall = Column(Float, nullable=True)
+    weather_temp     = Column(Float, nullable=True)
+    weather_aqi      = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     policy = relationship("Policy", back_populates="claims")

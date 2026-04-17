@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
 from app.routers import workers, policies, premiums, triggers, claims, ml, advisor, admin
-from app.scheduler import start_scheduler
+from app.scheduler import start_scheduler, last_run_info
 
 Base.metadata.create_all(bind=engine)
 
@@ -44,3 +44,8 @@ app.include_router(admin.router)
 @app.get("/")
 def root():
     return {"message": "AI Gig Worker Insurance API - Phase 1"}
+
+
+@app.get("/scheduler/status")
+def scheduler_status():
+    return last_run_info

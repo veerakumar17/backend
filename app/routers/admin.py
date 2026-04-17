@@ -1,11 +1,13 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, Column, Integer, String
 from app.database import get_db, Base
-from app.models import Policy, Claim, Premium, Worker, ClaimStatus, PolicyStatus
+from app.models import Policy, Claim, Premium, Worker, ClaimStatus, PayoutStatus, PolicyStatus
 from app.services.weather_service import fetch_weather
 from app.services.aqi_service import fetch_aqi
 from app.services.risk_service import predict_risk_from_env
+from app.services.fraud_service import compute_fraud_score, score_to_action, full_fraud_report
 from app.config import THRESHOLDS, LABELS
 from datetime import datetime, timedelta
 from collections import Counter
@@ -117,6 +119,8 @@ def admin_fire_trigger_by_location(data: dict, db: Session = Depends(get_db)):
     if not policies:
         raise HTTPException(status_code=404, detail=f"No eligible workers found in '{location}'.")
 
+    live_weather = {**weather, "aqi": aqi_data.get("aqi", 0.0)}
+
     created = []
     for policy in policies:
         for trigger_type, value in triggered:
@@ -128,19 +132,67 @@ def admin_fire_trigger_by_location(data: dict, db: Session = Depends(get_db)):
             ).first()
             if already:
                 continue
-            note = f"{LABELS[trigger_type]} detected in {location} — value {value} exceeded threshold {THRESHOLDS[trigger_type]}."
-            claim = Claim(
+
+            fraud_score, fraud_flags = compute_fraud_score(
+                db            = db,
                 policy_id     = policy.id,
                 trigger_type  = trigger_type,
                 trigger_value = value,
-                payout_amount = policy.max_payout,
-                status        = ClaimStatus.approved,
-                admin_note    = note,
-                triggered_by  = f"admin:{admin_name}",
+                worker_city   = policy.worker.location,
+                claim_city    = location,
+            )
+            _, action = score_to_action(fraud_score)
+            if action == "Block":
+                created.append({
+                    "claim_id": None,
+                    "worker": policy.worker.name,
+                    "trigger": LABELS[trigger_type],
+                    "payout": 0,
+                    "txn_id": None,
+                    "blocked": True,
+                    "fraud_score": fraud_score,
+                    "fraud_flags": fraud_flags,
+                })
+                continue
+
+            claim_status = ClaimStatus.pending if action == "Monitor" else ClaimStatus.approved
+            note = f"{LABELS[trigger_type]} detected in {location} — value {value} exceeded threshold {THRESHOLDS[trigger_type]}."
+            if fraud_flags:
+                note += " | Fraud flags: " + "; ".join(fraud_flags)
+
+            claim = Claim(
+                policy_id        = policy.id,
+                trigger_type     = trigger_type,
+                trigger_value    = value,
+                payout_amount    = policy.max_payout,
+                fraud_score      = fraud_score,
+                status           = claim_status,
+                admin_note       = note,
+                triggered_by     = f"admin:{admin_name}",
+                weather_rainfall = live_weather.get("rainfall"),
+                weather_temp     = live_weather.get("temp"),
+                weather_aqi      = live_weather.get("aqi"),
             )
             db.add(claim)
-            db.flush()  # get claim.id before commit
-            created.append({"claim_id": claim.id, "worker": policy.worker.name, "trigger": LABELS[trigger_type], "payout": policy.max_payout})
+            db.flush()
+
+            txn_id = None
+            if claim_status == ClaimStatus.approved:
+                txn_id = f"payout_{uuid.uuid4().hex[:16].upper()}"
+                claim.payout_status         = PayoutStatus.processed
+                claim.payout_transaction_id = txn_id
+                claim.payout_processed_at   = datetime.utcnow()
+
+            created.append({
+                "claim_id":    claim.id,
+                "worker":      policy.worker.name,
+                "trigger":     LABELS[trigger_type],
+                "payout":      policy.max_payout if claim_status == ClaimStatus.approved else 0,
+                "txn_id":      txn_id,
+                "blocked":     False,
+                "fraud_score": fraud_score,
+                "fraud_flags": fraud_flags,
+            })
 
     db.commit()
     return {
@@ -284,103 +336,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
 @router.get("/fraud-detection")
 def fraud_detection(db: Session = Depends(get_db)):
-    """
-    Runs fraud detection on all workers using rule-based scoring:
-    - Abnormal claim frequency (5+ claims/month)  → +20
-    - Same trigger claimed 3+ times total          → +30
-    - Duplicate claim within 1 hour               → +40
-    - GPS/location mismatch (multiple cities)      → +30
-    Score 0-30: Low, 30-70: Medium (Monitor), 70+: High (Block)
-    """
     workers = db.query(Worker).all()
     results = []
-    now = datetime.utcnow()
-
     for worker in workers:
-        policy = worker.policy
-        if not policy:
-            continue
-
-        all_claims = db.query(Claim).filter(Claim.policy_id == policy.id).all()
-        score = 0.0
-        flags = []
-
-        # 1. Abnormal claim frequency this month
-        this_month = [c for c in all_claims
-                      if c.created_at.month == now.month and c.created_at.year == now.year]
-        if len(this_month) >= 5:
-            score += 20.0
-            flags.append(f"High claim frequency: {len(this_month)} claims this month")
-
-        # 2. Same trigger claimed 3+ times total
-        from collections import Counter
-        trigger_counts = Counter(c.trigger_type for c in all_claims)
-        for trigger, count in trigger_counts.items():
-            if count >= 3:
-                score += 30.0
-                flags.append(f"Repeated trigger: {trigger} claimed {count} times")
-                break
-
-        # 3. Any claim within 1 hour of a previous claim (rapid successive claims)
-        sorted_claims = sorted(all_claims, key=lambda c: c.created_at)
-        for i in range(1, len(sorted_claims)):
-            diff = (sorted_claims[i].created_at - sorted_claims[i-1].created_at).total_seconds()
-            if diff < 3600:
-                score += 40.0
-                flags.append("Rapid successive claims detected (within 1 hour)")
-                break
-
-        # 4. Multiple locations detected (worker location vs claim trigger locations)
-        admin_locations = set()
-        for c in all_claims:
-            if c.admin_note and "detected" in c.admin_note and " in " in c.admin_note:
-                parts = c.admin_note.split(" in ")
-                if len(parts) > 1:
-                    city = parts[1].split(" ")[0].rstrip(".—,")
-                    admin_locations.add(city)
-        if len(admin_locations) > 1 and worker.location not in admin_locations:
-            score += 30.0
-            flags.append(f"Location mismatch: worker in {worker.location}, claims from {', '.join(admin_locations)}")
-
-        # 5. GPS Spoofing: claims from multiple distinct cities on the same day
-        from collections import defaultdict
-        claims_by_day: dict = defaultdict(set)
-        for c in all_claims:
-            if c.admin_note and " in " in c.admin_note:
-                parts = c.admin_note.split(" in ")
-                if len(parts) > 1:
-                    city = parts[1].split(" ")[0].rstrip(".—,")
-                    claims_by_day[c.created_at.date()].add(city)
-        for day, cities in claims_by_day.items():
-            if len(cities) > 1:
-                score += 30.0
-                flags.append(f"GPS spoofing suspected: claims from {len(cities)} cities on {day}")
-                break
-
-        score = min(score, 90.0)
-        if score >= 70:
-            risk_level = "High"
-            action     = "Block"
-        elif score >= 30:
-            risk_level = "Medium"
-            action     = "Monitor"
-        else:
-            risk_level = "Low"
-            action     = "Allow"
-
-        results.append({
-            "worker_id":    worker.id,
-            "worker_name":  worker.name,
-            "location":     worker.location,
-            "plan":         policy.plan,
-            "total_claims": len(all_claims),
-            "claims_month": len(this_month),
-            "fraud_score":  round(score, 1),
-            "risk_level":   risk_level,
-            "action":       action,
-            "flags":        flags,
-        })
-
+        report = full_fraud_report(db, worker)
+        if report:
+            results.append(report)
     results.sort(key=lambda x: x["fraud_score"], reverse=True)
     return results
 

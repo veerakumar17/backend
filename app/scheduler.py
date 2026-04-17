@@ -1,15 +1,17 @@
+import uuid
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
-from app.models import Policy, Claim, ClaimStatus, PolicyStatus, Worker
+from app.models import Policy, Claim, ClaimStatus, PayoutStatus, PolicyStatus, Worker
 from app.services.weather_service import fetch_weather, fetch_flood_alert
 from app.services.aqi_service import fetch_aqi
+from app.services.fraud_service import compute_fraud_score, score_to_action
 from app.config import THRESHOLDS
 from datetime import datetime, date
 
-# Fraud score thresholds
 FRAUD_BLOCK_SCORE = 70.0
-FRAUD_MONITOR_SCORE = 30.0
+
+last_run_info = {"last_run": None, "claims_created": 0, "payouts_processed": 0}
 
 
 def _already_claimed_today(db: Session, policy_id: int, trigger_type: str) -> bool:
@@ -22,45 +24,15 @@ def _already_claimed_today(db: Session, policy_id: int, trigger_type: str) -> bo
 
 
 def _is_payment_overdue(policy: Policy) -> bool:
-    """Returns True if policy is in grace period or post-grace pending state."""
     if policy.grace_period_end is None:
         return False
     return datetime.utcnow() <= policy.grace_period_end
 
 
-def _compute_fraud_score(db: Session, policy_id: int, trigger_type: str) -> float:
-    """
-    Simple rule-based fraud scoring:
-    - Abnormal claim frequency this month  → +20
-    - Same trigger claimed 3+ times total  → +30
-    - Claim within 1 hour of last claim    → +40
-    Max score = 90
-    """
-    score = 0.0
-    now = datetime.utcnow()
-
-    all_claims = db.query(Claim).filter(Claim.policy_id == policy_id).all()
-
-    # Abnormal frequency: more than 5 claims this month
-    this_month = [c for c in all_claims if c.created_at.month == now.month and c.created_at.year == now.year]
-    if len(this_month) >= 5:
-        score += 20.0
-
-    # Same trigger claimed 3+ times total
-    same_trigger = [c for c in all_claims if c.trigger_type == trigger_type]
-    if len(same_trigger) >= 3:
-        score += 30.0
-
-    # Claim within last 1 hour
-    recent = [c for c in all_claims if (now - c.created_at).total_seconds() < 3600]
-    if recent:
-        score += 40.0
-
-    return min(score, 90.0)
-
-
 def run_auto_trigger():
     db: Session = SessionLocal()
+    claims_created    = 0
+    payouts_processed = 0
     try:
         policies = (
             db.query(Policy)
@@ -81,6 +53,9 @@ def run_auto_trigger():
             except Exception:
                 continue
 
+            # merge aqi into weather dict so fraud service can read it
+            live_weather = {**weather, "aqi": aqi_data.get("aqi", 0.0)}
+
             checks = {
                 "rainfall":    weather.get("rainfall", 0.0),
                 "temperature": weather.get("temp", 0.0),
@@ -88,7 +63,6 @@ def run_auto_trigger():
                 "flood":       flood_24h,
             }
 
-            # Determine if payment is overdue (grace period active)
             payment_overdue = _is_payment_overdue(policy)
 
             for trigger_type, value in checks.items():
@@ -97,32 +71,61 @@ def run_auto_trigger():
                 if _already_claimed_today(db, policy.id, trigger_type):
                     continue
 
-                # Fraud check
-                fraud_score = _compute_fraud_score(db, policy.id, trigger_type)
-                if fraud_score >= FRAUD_BLOCK_SCORE:
-                    continue
+                fraud_score, fraud_flags = compute_fraud_score(
+                    db            = db,
+                    policy_id     = policy.id,
+                    trigger_type  = trigger_type,
+                    trigger_value = value,
+                    worker_city   = city,
+                    claim_city    = city,
+                )
 
-                # Determine claim status
-                if payment_overdue:
-                    claim_status = ClaimStatus.pending
-                elif fraud_score >= FRAUD_MONITOR_SCORE:
+                risk_level, action = score_to_action(fraud_score)
+
+                if action == "Block":
+                    continue  # fraud blocked — no claim created
+
+                if payment_overdue or action == "Monitor":
                     claim_status = ClaimStatus.pending
                 else:
                     claim_status = ClaimStatus.approved
 
+                note = (
+                    f"Auto-triggered: {trigger_type} value {value} exceeded "
+                    f"threshold of {THRESHOLDS[trigger_type]}."
+                )
+                if fraud_flags:
+                    note += " | Fraud flags: " + "; ".join(fraud_flags)
+
                 claim = Claim(
-                    policy_id     = policy.id,
-                    trigger_type  = trigger_type,
-                    trigger_value = value,
-                    payout_amount = policy.max_payout,
-                    fraud_score   = fraud_score,
-                    status        = claim_status,
-                    admin_note    = f"Auto-triggered: {trigger_type} value {value} exceeded threshold of {THRESHOLDS[trigger_type]}.",
-                    triggered_by  = "auto",
+                    policy_id        = policy.id,
+                    trigger_type     = trigger_type,
+                    trigger_value    = value,
+                    payout_amount    = policy.max_payout,
+                    fraud_score      = fraud_score,
+                    status           = claim_status,
+                    admin_note       = note,
+                    triggered_by     = "auto",
+                    weather_rainfall = live_weather.get("rainfall"),
+                    weather_temp     = live_weather.get("temp"),
+                    weather_aqi      = live_weather.get("aqi"),
                 )
                 db.add(claim)
+                db.flush()
+                claims_created += 1
+
+                if claim_status == ClaimStatus.approved:
+                    txn_id = f"payout_{uuid.uuid4().hex[:16].upper()}"
+                    claim.payout_status         = PayoutStatus.processed
+                    claim.payout_transaction_id = txn_id
+                    claim.payout_processed_at   = datetime.utcnow()
+                    payouts_processed += 1
 
         db.commit()
+        last_run_info["last_run"]          = datetime.utcnow().isoformat()
+        last_run_info["claims_created"]    = claims_created
+        last_run_info["payouts_processed"] = payouts_processed
+        print(f"[Scheduler] Run complete — {claims_created} claims, {payouts_processed} payouts processed")
     except Exception as e:
         print(f"[Scheduler] Error: {e}")
     finally:
@@ -131,7 +134,7 @@ def run_auto_trigger():
 
 def start_scheduler():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_auto_trigger, "interval", hours=1, id="auto_trigger", next_run_time=datetime.utcnow())
+    scheduler.add_job(run_auto_trigger, "interval", minutes=5, id="auto_trigger", next_run_time=datetime.utcnow())
     scheduler.start()
-    print("[Scheduler] Auto-trigger job started.")
+    print("[Scheduler] Auto-trigger job started (runs every 5 minutes for testing).")
     return scheduler
